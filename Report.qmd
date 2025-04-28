@@ -1,0 +1,611 @@
+---
+title: "Report"
+author: "Miguel Angel Donado Fernandez"
+date: "28/abr/2025"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(tfruns)
+```
+
+### SUMMARY TFRUNS
+```{r summary_tfruns, echo=FALSE}
+# View summary of runs results (we get a df)
+ls_runs_df <- ls_runs(order = metric_val_loss, decreasing = FALSE, runs_dir = "_tuning")
+ls_runs_df <- ls_runs_df %>% select(!c(metrics, model, optimizer, script, output, source_code))
+knitr::kable(ls_runs_df)
+```
+
+### BEST RUN HYPERPARAMETERS
+```{r best_run, echo=FALSE}
+best_run <- ls_runs(order = metric_val_mean_squared_error, decreasing = FALSE, runs_dir = "_tuning")[1,]
+# Generate dinamically flags_best_run
+flags_best_run <- best_run %>% 
+  select(starts_with("flag_")) %>% 
+  rename_with(~ gsub("^flag_", "", .)) %>% 
+  as.list()
+knitr::kable(as_data_frame(flags_best_run))
+```
+
+```{r defaults_equal_to_best_run_hyper}
+library(tfruns)
+# Generate FLAGS dinamically
+flag_list <- purrr::imap(flags_best_run, function(value, name) {
+  if (is.character(value)) {
+    flag_string(name, default = value)
+  } else if (is.integer(value) || (is.numeric(value) && value == as.integer(value))) {
+    flag_integer(name, default = value)
+  } else if (is.numeric(value)) {
+    flag_numeric(name, default = value)
+  } else {
+    stop(paste("Unsupported type for", name))
+  }
+})
+
+# Now build FLAGS from the list
+FLAGS <- do.call(flags, flag_list)
+FLAGS
+```
+
+```{r Setup}
+# Local specific setup
+# setwd("~/UPC/UPC_Q3/DNN/Trabajos/5.SecondAssignment_SequenceText/")
+library(reticulate)
+use_virtualenv("~/.venvs/deep_neural_network3.9")
+# Check Python is being properly executed in R
+py_config()
+train_path <- "./seg_pred/" 
+
+# ML/AI specific setup
+library(tensorflow)
+library(keras3)
+library(tfdatasets)
+
+# Other setup
+library(tidyverse)
+library(caret)
+library(irlba)
+library(clusterCrit)
+library(ggrepel)
+library(abind)
+
+```
+
+```{r Callbacks}
+callbacks_list <- list(
+  callback_early_stopping(
+    monitor = "val_loss",
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath = "best_model.keras",
+    monitor = "val_loss",
+    save_best_only = TRUE
+  ),
+  callback_reduce_lr_on_plateau(
+    monitor="val_loss",
+    factor = FLAGS$reduce_lr_factor, 
+    patience = FLAGS$reduce_lr_patience,
+  )
+)
+```
+
+```{r Initialization_parameters}
+# Input image dimensions
+img_rows <- 150
+img_cols <- 150
+input_dim <- c(150,150,3)
+seed_train_validation = 1
+shuffle_value = FALSE
+validation_split = 0.3
+```
+
+```{r Loading_images}
+## Load images. Explanation: https://stackoverflow.com/questions/66036271/splitting-a-tensorflow-dataset-into-training-test-and-validation-sets-from-ker
+train_data <- image_dataset_from_directory(
+  directory = train_path,
+  image_size = c(img_rows,img_cols),
+  validation_split = validation_split,
+  subset = "training",
+  seed = seed_train_validation,
+  shuffle = shuffle_value,
+  batch_size = FLAGS$batch_size,
+  labels = NULL                                 # autoencoder (reconstruct input)
+)
+val_data <- image_dataset_from_directory(
+  directory = train_path,
+  image_size = c(img_rows,img_cols),
+  validation_split = validation_split,
+  subset = "validation",
+  seed = seed_train_validation,
+  shuffle = shuffle_value,
+  batch_size = FLAGS$batch_size,
+  labels = NULL                                 # autoencoder (reconstruct input)
+)
+```
+
+```{r Normalize_preprocess_tf.dataset_object}
+# Aclarations: 
+# - layer_rescaling(scale = 1/255) inside the model it doesnt work because only normalize inputs but not labels
+# - dataset_prefetch(buffer_size = AUTOTUNE): Prefetch next batch while computing current (increase speed)
+
+# Prepare dataset:
+# 1. Adding labels (input = label)
+# 2. Normalize
+train_data <- train_data %>% dataset_map(function(x) list(x / 255, x / 255)) %>% dataset_prefetch(buffer_size = tf$data$AUTOTUNE)
+val_data <- val_data %>% dataset_map(function(x) list(x / 255, x / 255)) %>% dataset_prefetch(buffer_size = tf$data$AUTOTUNE)
+
+# Predict function expects only inputs, not pairs (input,label)
+# So, we create variables that only contains the inputs
+train_inputs <- train_data %>% dataset_map(function(x,y) x) 
+val_inputs <- val_data %>% dataset_map(function(x,y) x) 
+```
+
+```{r Check_loading_is_right}
+# Aclarations: 
+# - as_iterator: Converts train_data (special object in Tensorflow a tf.data.Dataset) on an iterator
+# - iter_next: Function to iterate over an iterator
+
+# 1. Check properly loaded 
+# 2. Save image for later prediction with model
+
+batch <- as_iterator(train_data) %>% iter_next()
+str(batch)
+
+## Plot an image
+original_images <- batch[[1]] 
+original_image <- original_images[1,,,]
+original_image_batch <- tf$expand_dims(original_image, axis = as.integer(0))
+img_array <- as.array(original_image) 
+plot(as.raster(img_array))
+```
+
+## Exercise 1
+
+```{r Convolutional_encoder}
+input_img <- layer_input(shape = input_dim)
+output_enc <- input_img %>% 
+  layer_conv_2d(filters = 16, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  layer_max_pooling_2d(pool_size = 2, padding = "same") %>% 
+  
+  layer_conv_2d(filters = 32, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  layer_max_pooling_2d(pool_size = 2, padding = "same") %>% 
+
+  layer_conv_2d(filters = 45, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  layer_max_pooling_2d(pool_size = 2, padding = "same") 
+
+model_enc <- keras_model(inputs = input_img, outputs = output_enc)
+summary(model_enc)
+
+paste0('Flatten layer: ', 19 * 19 * 45, " units")
+```
+
+```{r Convolutional_decoder}
+encoded_input <- layer_input(shape = c(19, 19, 45)) # flatten output
+output_dec <- encoded_input %>% 
+  layer_conv_2d(filters = 45, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  
+  layer_upsampling_2d(size = 2) %>% 
+  layer_conv_2d(filters = 32, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  
+  layer_upsampling_2d(size = 2) %>%  
+  layer_conv_2d(filters = 16, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  
+  layer_upsampling_2d(size = 2) %>%  
+  # On this last layer I use to sigmoid to force that values are between 0-1 range. For more info https://stackoverflow.com/questions/65307833/why-is-the-decoder-in-an-autoencoder-uses-a-sigmoid-on-the-last-layer
+  layer_conv_2d(filters = 3, kernel_size = 3, activation = "sigmoid")
+
+model_dec <- keras_model(inputs = encoded_input, outputs = output_dec)
+summary(model_dec)
+```
+
+```{r Check_input_dim_output_dim}
+# Check input dimension == output dimension
+input_dim <- unlist(model_enc$input_shape)
+output_dim <- unlist(model_dec$output_shape)
+
+if (identical(input_dim, output_dim)) {
+  cat("Same dimensions:", input_dim, "\n")
+} else {
+  cat("Different dimensions:\nInput:", input_dim, "\nOutput:", output_dim, "\n")
+}
+```
+
+```{r Autoencoder}
+model <- keras_model_sequential()
+model %>%  model_enc %>%  model_dec
+
+summary(model)
+```
+
+```{r Compile_Training} 
+# Aclaration:
+#   - Validation_data instead of validation_split
+
+########## Training
+model %>% compile(
+  optimizer = "adam",
+  loss = "mean_squared_error",
+  metrics = c("mean_squared_error")
+)
+
+history <- model %>% fit(
+  x = train_data, # Autoencoder
+  epochs = FLAGS$epochs,
+  validation_data = val_data,      
+  callbacks = callbacks_list
+) 
+```
+
+## Exercise 2
+
+```{r Additional_Evaluate_visually_quality_reconstruction}
+# Is not asked, but for curiosity, taking as example "CAE slides" I plot 
+# one original image vs the reconstructed version
+
+##### Prediction
+reconstructed_img <- predict(model, original_image_batch)
+dim(reconstructed_img)
+
+# From input to decoder
+enc_output_img <- predict(model_enc, original_image_batch)
+dim(enc_output_img)
+
+# From encoder to decoder
+dec_output_img <- predict(model_dec, enc_output_img)
+dim(dec_output_img)
+
+## Inspect/compare visually both images (original and reconstructed)
+
+# Original image
+im <- original_image_batch[1,,,]
+plot(as.raster(im))
+title(main = "Original image")
+
+# Reconstructed image (using autoencoder "model")
+r_im <- reconstructed_img[1,,,]
+plot(as.raster(r_im))
+title(main = "Reconstructed image autoencoder")
+
+# Decoder image (same result than "model", but I do it separately first predict with "model_enc" 
+# and pass the output as input to "model_dec" and predict (clearly is gonna be the same, but for 
+# demonstrational purposes and following the same logic than in CAE slides)     
+r_im_v2 <- dec_output_img[1,,,]
+plot(as.raster(r_im_v2))
+title(main = "Reconstructed image encoder-decoder")
+```
+
+#### Conclusion:
+- Visually, we can appreciate that as we saw on the slides the CAE is lossy, that is, we are losing some info,
+but the reconstruction is not that bad. 
+
+```{r Additional_Plot_latent_feature_maps}
+# Again, is not asked but for curiosity taking as example "CAE slides" I plot some
+# latent feature maps
+
+## Check encoder results (there are 45 filters (2D feature maps)
+# each of the filters 19x19 (height x width)
+# Check e.g. 5,6,7 and 8 filter
+par(mfrow = c(2,2))
+for (k in 5:8){
+  latent_feature_map <- matrix(enc_output_img[1,,,k],nrow=19,ncol=19)
+  image(1:19, 1:19, latent_feature_map, col=gray((0:255)/255))
+}
+```
+
+```{r Garbage_Collector_one}
+# Free unused memory
+gc()
+```
+
+
+- After this two additional code chunks, **I start with main topic asked on exercise 2**
+- The metrics used to evaluate quaility of reconstructed image will be
+  1. **MSE**: Mean squared error pixel by pixel (the smaller the best)
+  2. **PSNR** (peak-signal-to-noise-ratio): (the higher the better)
+    - Signal: Original image data
+    - Noise: Distortion introduced during compression
+- We'll measure this metrics over the validation data
+
+```{r Evaluate_numerically_quality_reconstruction}
+# Aclarations: 
+# 1. "validate_quality_reconstruction_img" function:
+#   - Tension between speed and memory usage
+#   - An option could be iterate all at once, taking full advantage of vectorize operations
+#     but if dataset too big, then the memory usage could crash PC (faster but memory usage can explode)
+#     (for this dataset it wont be a problem, but for the sake of trying to make this part scalable i choose  #     next option)
+#   - The other option, is go batch by batch (loop) slower but safer. This is the chosen one.
+
+validate_quality_reconstruction_img <- function(autoencoder, val_inputs) {
+
+  # Iterator original images
+  val_iterator <- as_iterator(val_inputs)
+
+  # Initialize list
+  mse_list <- c()
+  
+  repeat {
+    # Even though it could look complicated, we're just extracting the next batch of original imgs 
+    # and making sure to handle than after exhausted the iterator (after've seen all batches) it doesnt raise
+    # any error
+    batch <- tryCatch(iter_next(val_iterator), error = function(e) NULL)
+    if (is.null(batch)) break
+    
+    # Predict batch by batch
+    reconstructed_batch <- predict(autoencoder, batch, verbose = 0)
+    
+    # Compute MSE
+    diffs <- (as.array(batch) - as.array(reconstructed_batch))^2
+    
+    # diffs: Array of squared errors (batch_size x 150 x 150 x 3)
+    # 1: Apply function mean() per image (per 1st dimension) 
+    # I get a vector with mse of all images in the batch
+    mse_batch <- apply(diffs, 1, mean) 
+    
+    mse_list <- c(mse_list, mse_batch)
+  }
+  
+  # Results
+  mse_global <- mean(as.numeric(mse_list))
+  psnr_global <- 20 * log10(1) - 10 * log10(mse_global)
+  
+  cat("Average MSE: ", mse_global, "\n")
+  cat("Average PSNR: ", psnr_global, "dB\n")
+  
+  return(list(MSE = mse_global, PSNR = psnr_global))
+}
+
+metrics <- validate_quality_reconstruction_img(autoencoder = model, val_inputs = val_inputs)
+```
+
+#### Conclusion: 
+- The value of MSE is low, but should be lower. 
+- PSNR I checked ranges on internet, and <20 dB means low quality, indicating that
+we have blurry, loss of details. If > 30 dB would be very good quality.
+
+```{r Garbage_Collector_two}
+# Free memory no longer needed
+gc()
+```
+
+## Exercise 3
+
+```{r}
+latent_train <- predict(model_enc, train_inputs)
+dim(latent_train)
+
+num_imgs <- dim(latent_train)[1] 
+# The -1 automatically flattens the latent feature map into a vector = 19 * 19 * 45
+# For doing clustering is neccesary to flatten 
+latent_train_vectors <- array_reshape(latent_train, dim = c(num_imgs, -1))
+dim(latent_train_vectors)
+```
+
+## Exercise 4 and 5
+- Several methods to evaluate clustering quality and to determine the number of clusters, some of them require a distance matrix, whereas others accept a data matrix. (Gap Statistic, CH-index, Silhoutte..) 
+- Computing a distance matrix could be expensive if dataset big so let's try to stick with the data matrix.
+
+- Final procedure:
+  1. At first tried with original data matrix but too many dimensions, computationally took too much time. So, I apply dimensionaly reduction up to 50 dimensions 
+  2. Then I used one of the most simple heuristics to determine number of clusters (**elbow method**) very cheap computationally
+  3. I also perform **CH-index** (its also quite fast to compute)
+  
+### Intutition methods used
+1. Elbow method:
+  - Before elbow: Adding clusters improves a lot
+  - After elbow: Adding clusters doesnt improve too much
+2. CH-index 
+  - Ratio between-cluster dispersion to within cluster dispersion
+  - Higher when clusters are compact and well-separated (the higher the better)
+
+### SECTION 4 AND 5.A): K-menas and number of clusters
+
+```{r Dimensionality_reduction}
+latent_pca <- prcomp_irlba(latent_train_vectors, n = 50, center = TRUE, scale. = FALSE)
+
+latent_reduced <- latent_pca$x
+```
+
+```{r Choose_right_number_clusters}
+# Range k values to test
+k_values <- 1:10
+
+# Vector store CH-index
+ch_scores <- numeric(length(k_values))
+
+# Vector store wss
+wss <- numeric(length(k_values))
+
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  
+  # K-means 
+  kmeans_result <- kmeans(latent_reduced, centers = k, nstart = 10)
+  
+  # CH-Index
+  ch <- intCriteria(as.matrix(latent_reduced),
+                    as.integer(kmeans_result$cluster),
+                    "Calinski_Harabasz")
+  # Save ch-index
+  ch_scores[i] <- ch[[1]]
+  
+  # Save wss
+  wss[i] <- kmeans_result$tot.withinss
+}
+
+# Plot elbow 
+plot(k_values, wss, type = "b", pch = 19,
+     xlab = "Number of Clusters (k)",
+     ylab = "Total Within-Cluster Sum of Squares (WSS)",
+     main = "Elbow Heuristic")
+
+# Choose best k according CH-index
+best_k <- k_values[which.max(ch_scores)]
+cat("Best number of clusters according to CH index:", best_k, "\n")
+```
+
+#### Conclusion
+- According CH-index and elbow method the right number of clusters is 2.
+
+```{r K_means_with_right_number_clusters}
+# Perform k-means with best k clusters
+kmeans_best_k <- kmeans(latent_reduced, centers = best_k, nstart = 10)
+
+# Mapping images - cluster
+mapping_imgs_clusters <- kmeans_best_k$cluster
+```
+
+```{r Garbage_Collector_three}
+# Free memory no longer needed
+gc()
+```
+
+### SECTION 5.B): Check visually if clusters are associated with images themes
+
+```{r Extract_all_images}
+# Function to extract all images.
+#  - Motivation:
+#   1. Im gonna pick some random images on each cluster to plot
+#   2. "train_data" and "train_inputs" are tf.dataset objects and they need to be iterated to extract batches.
+#   3. But on my case, I need a data structure that contains all the image
+#   4. e.g. I want image with index 3002 and 4076 because both belongs to cluster "1" and I want to plot them.
+#   5. So in order to have such data structure where all images are stored I create this function
+# 
+# Disadvantages: I'm aware that if dataset were bigger, maybe such data structure would take up too much memory, and another # approach should be used. I guess that best approach would be to access images directly from disk
+extract_all_images <- function(dataset) {
+  images_list <- list()
+  iter <- as_iterator(dataset)
+  
+  repeat {
+    batch <- tryCatch(iter_next(iter), error = function(e) NULL)
+    if (is.null(batch)) break
+    
+    batch_images <- batch[[1]]                 # inputs (32 x 150 x 150 x 3)
+    batch_array <- as.array(batch_images)      
+    images_list <- c(images_list, list(batch_array))
+  }
+  
+  all_images <- abind(images_list, along = 1) # Stack along first dimension (single array => all images x 150 x 150 x 3)
+  return(all_images)
+}
+```
+
+```{r Plot_3_images_per_cluster}
+# Data structure that contains all images
+train_images <- extract_all_images(train_data)
+
+# Unique clusters
+clusters <- sort(unique(mapping_imgs_clusters))
+num_clusters <- length(clusters)
+
+# Number of images to plot per cluster
+imgs_per_cluster <- 3
+
+# Plot 
+par(mfrow = c(num_clusters, imgs_per_cluster), mar = c(1,1,1,1))
+
+for (cluster in clusters) {
+  set.seed(123)
+  # Find index of imgs belogns to cluster_id
+  index_images_cluster <- which(mapping_imgs_clusters == cluster)
+  
+  # Sample images to plot
+  index_selected_images_cluster <- sample(index_images_cluster, imgs_per_cluster)
+  
+  # Plot selected images
+  lapply(index_selected_images_cluster, function(idx) {
+    img <- train_images[idx,,,]
+    plot(as.raster(img))
+    title(main= paste("Cluster", cluster))
+  })
+}
+```
+
+#### Conclusion
+- Regarding the question about the relationship of the clusters with the themes of the images.
+- Looks that cluster 1 are cities/vehicles... whereas cluster2 are landscapes. Maybe this statement it's a bit
+risky, but looks so. Except first image on cluster 1, that is "misclassified", the rest looks has sense.
+
+```{r Empty_memory}
+Sys.sleep(1)
+gc()
+rm(train_images)
+```
+
+## Exercise 6
+
+```{r Plot_PCA_2_dimensions}
+#### Exercise 6
+library(ggplot2)
+library(ggrepel)
+
+# latent_reduced: 5111 x 50 (array containing all images reduced to 50 dimensions)
+data_to_project <- latent_reduced 
+dim(data_to_project)[1]
+
+# v_labels: Labels for each cluster (we don't have any label, so we assign numerical labels)
+v_labels <- as.factor(mapping_imgs_clusters)
+
+# Number of labels
+n_v_labels <- nlevels(v_labels)
+
+k <- dim(data_to_project)[1]
+
+plotPCA3 <- function (datos, loads, labels, factor,title,scale,colores, size = 2, glineas = 0.25) {
+  # Datos: 5111 x 50 (array of images reduced to 50 dim)
+  dataDf <- as.data.frame(datos)
+  Group <- factor
+  # the graphic
+  p1 <- ggplot(dataDf,aes(x=PC1, y=PC2)) +
+    theme_classic() +
+    geom_hline(yintercept = 0, color = "gray70") +
+    geom_vline(xintercept = 0, color = "gray70") +
+    geom_point(aes(color = Group), alpha = 0.55, size = 3) +
+    coord_cartesian(xlim = c(min(datos[,1])-5,max(datos[,1])+5)) +
+    scale_fill_discrete(name = "")
+  # the graphic with ggrepel
+  p1 + geom_text_repel(aes(y = PC2 + 0.25, label = labels),segment.size = 0.25, size = size) +
+    labs(x = c(paste("PC1",loads[1],"%")),y=c(paste("PC2",loads[2],"%"))) +
+    ggtitle(paste("PCA based on", title, sep=" "))+
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_color_manual(values=colores)
+}
+scale = FALSE
+if (n_v_labels > 2) {
+  colores <- brewer.pal(n = n_v_labels, name = "RdBu")
+} else {
+  colores <- c("red","blue")
+}
+
+# Load of each PC
+loads <- latent_pca$sdev^2/sum(latent_pca$sdev^2)*100
+
+plotPCA3(datos = data_to_project[1:k,],
+         loads = round(loads,1),
+         labels = rep("",k),
+         factor = v_labels[1:k],
+         scale = scale,
+         title = paste ("last encode layer.", "# Samples:", k),
+         colores = colores)
+
+```
+
+#### CONCLUSION
+- I can clearly see two separated groups along PC1.
+- Clusters are compact, not too spread out.
+- Little overlap between clusters.
+- It looks model captures the important structure in the data.
+
+
+
+
+
+
+
+
+
+
+
+
