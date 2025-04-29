@@ -1,0 +1,433 @@
+---
+title: "Report"
+author: "Miguel Angel Donado Fernandez"
+date: "29/abr/2025"
+format:
+  html:
+    self-contained: true
+---
+
+```{r}
+library(reticulate)
+use_virtualenv("/home/miguel/.venvs/deep_neural_network3.9")
+```
+
+```{python}
+from keras.datasets import mnist
+import numpy as np
+np.random.seed(10)
+```
+
+```{python}
+from time import time
+#import numpy as np
+import tensorflow as tf
+import tensorflow.keras.backend as K
+from tensorflow.keras.layers import Layer, InputSpec
+from tensorflow.keras.utils import image_dataset_from_directory
+from keras.layers import Dense, Input, Conv2D, MaxPooling2D, UpSampling2D, Input, Dropout, Flatten, Reshape
+from keras.models import Model
+from keras.optimizers import SGD
+from keras import callbacks
+from keras.initializers import VarianceScaling
+from sklearn.cluster import KMeans
+from sklearn import metrics
+from keras.datasets import fashion_mnist
+import matplotlib.pyplot as plt
+```
+
+# First step: Get embedded data points and then perform standard k-means clustering in the feature space Z to obtain k initial centroids
+
+### First modification: Convolutional autoencoder
+
+-   I've removed **autoencoder** function and substitute it by the function **build_conv_autoencoder**
+
+-   I had doubts regarding this function, if it should be modified or not. Reasons that lead me to think it shouldn't be modified:
+
+    -   On the paper, it says that they use a stacked denoising autoencoder to initialize the parameters and centroids (and they test the algorithm with images datasets (MNIST...)
+    -   The provided .ipynb is already applying a **NOT** convolutional autoencoder to MNIST images.
+    -   Given all that, it seems that a CAE may not be the right way to initialize centroids and parameters of encoder.
+
+-   Finally I end up applying CAE, because I guess that the Dense layers could work well for small images, but for larger images (150x150x3) CAE makes more sense (because it preserves spatial structure, and otherwise the number of weights used with dense layers would be extremely large)
+
+-   I choose the easy way when implementing this function, it should be more dynamical, and so more arguments should be passed. Just for the sake of applying the algorithm DEC to our dataset of images (I believe the main goal of this exercise) I skip all the logic (loops...) and hardcode the layers that is gonna have the autoencoder for our purpose.
+
+-   On the last encoded layer I dont use 'ReLU', as the paper states.
+
+```{python}
+def build_conv_autoencoder(input_shape=(150, 150, 3), dropout_rate=0.3, init='glorot_uniform'):
+    input_img = Input(shape=input_shape)
+    
+    # First Convolutional
+    x = Conv2D(16, (3, 3), activation='relu', padding='same', kernel_initializer=init)(input_img)
+    x = Dropout(dropout_rate)(x)
+    x = MaxPooling2D((2, 2), padding='same')(x)
+    
+    # Second Convolutional
+    x = Conv2D(32, (3, 3), activation='relu', padding='same', kernel_initializer=init)(x)
+    x = Dropout(dropout_rate)(x)
+    x = MaxPooling2D((2, 2), padding='same')(x)
+    
+    # Third Convolutional
+    x = Conv2D(45, (3, 3), activation='relu', padding="same", kernel_initializer=init)(x)
+    x = Dropout(dropout_rate)(x)
+    x = MaxPooling2D((2, 2), padding='same')(x)
+
+    # Flatten  
+    shape_before_flatten = tf.keras.backend.int_shape(x)[1:]
+    x = Flatten()(x)
+    encoded = Dense(100, activation='linear', name='latent_vector')(x)
+    
+    # Decoder
+    x = Dense(np.prod(shape_before_flatten), activation='relu')(encoded)
+    x = Reshape(shape_before_flatten)(x)
+    
+    # First Convolutional (Decoder)
+    x = Conv2D(45, (3, 3), activation='relu', padding="same", kernel_initializer=init)(x)
+    x = UpSampling2D((2, 2))(x)
+    
+    # Second Convolutional (Decoder)
+    x = Conv2D(32, (3, 3), activation='relu', padding="same", kernel_initializer=init)(x)
+    x = UpSampling2D((2, 2))(x)
+    
+    # Third Convolutional (Decoder)
+    x = Conv2D(16, (3, 3), activation='relu', padding="same", kernel_initializer=init)(x)
+    x = UpSampling2D((2, 2))(x)
+    
+    decoded = Conv2D(3, (3, 3), activation="sigmoid")(x)
+    
+    autoencoder = Model(input_img, decoded, name='CAE')
+    encoder = Model(input_img, encoded, name='encoder')
+    
+    return autoencoder, encoder
+
+```
+
+### Second modification: Loading images process. Adapting it for our dataset. I remove the code related to the MNIST
+
+```{python Initialization_parameters}
+# Input image dimensions
+img_rows = 150
+img_cols = 150
+input_dim = [150,150,3]
+train_path = "./seg_pred/"
+shuffle_value = False
+batch_size = 32
+```
+
+```{python Loading_images}
+train_data = image_dataset_from_directory(
+    directory=train_path,
+    image_size=(img_rows, img_cols),
+    shuffle=shuffle_value,
+    batch_size=batch_size,
+    label_mode=None  
+)
+```
+
+```{python Normalize_preprocess_tf.dataset_object}
+# Normalize and prefetch (x, x) since input = label for autoencoder
+train_data = train_data.map(lambda x: (x / 255.0, x / 255.0))
+
+# Predict function expects only inputs, not pairs (input,label)
+# So, we create variables that only contains the inputs
+train_inputs = train_data.map(lambda x, y: x)
+```
+
+```{python Check_loading_is_right}
+# Get one batch from train_data
+batch = next(iter(train_data))
+
+# 1. Check properly loaded 
+# 2. Save image for later prediction with model
+original_images = batch[0]  
+original_image = original_images[0]  
+
+# Expand dims to create a batch of 1 (e.g., for prediction)
+original_image_batch = tf.expand_dims(original_image, axis=0)
+
+# Convert to numpy and plot
+img_array = original_image.numpy()
+plt.imshow(img_array)
+plt.axis('off')
+plt.show()
+```
+
+### 3. Training CAE to get latent space
+
+```{python}
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+
+# Callbacks
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    patience=10,
+    restore_best_weights=True
+)
+
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_loss',
+    factor=0.5,
+    patience=5,
+    min_lr=1e-6
+)
+
+callbacks_list = [early_stopping, reduce_lr]
+
+init = VarianceScaling(scale=1. / 3., mode='fan_in',
+                           distribution='uniform')
+autoencoder, encoder = build_conv_autoencoder(init = init)
+```
+
+```{python}
+from keras.utils import plot_model
+plot_model(autoencoder, to_file='autoencoder.png', show_shapes=True)
+from IPython.display import Image
+Image(filename='autoencoder.png')
+```
+
+#### For simplicity, I won't do any hyperparameter tuning, I will just take the same hyperparameters that the .ipynb had.
+
+```{python}
+pretrain_optimizer = SGD(learning_rate=1.0, momentum=0.9)
+pretrain_epochs = 30
+batch_size = 256
+save_dir = './results'
+
+
+# Compilar el modelo
+autoencoder.compile(
+    optimizer=pretrain_optimizer,
+    loss='mse'
+)
+
+# Entrenar el modelo
+autoencoder.fit(
+    train_data,
+    batch_size = batch_size,
+    epochs=pretrain_epochs,
+    callbacks=callbacks_list
+)
+# autoencoder.save_weights(save_dir + '/ae_weights.h5')
+```
+
+### 4.Get embedded data points and find right number of cluster
+
+```{python}
+latent_space = encoder.predict(train_inputs)
+latent_space.shape
+k_values = range(1, 11)
+
+wss = []
+
+for k in k_values:
+    kmeans = KMeans(n_clusters=k, n_init=10, random_state=0)
+    kmeans.fit(latent_space)
+    wss.append(kmeans.inertia_)  # inertia_ = WSS
+
+# Plot Elbow
+plt.figure(figsize=(8, 5))
+plt.plot(k_values, wss, 'bo-', markersize=8)
+plt.xlabel('Number of Clusters (k)')
+plt.ylabel('Total Within-Cluster Sum of Squares (WSS)')
+plt.title('Elbow Method for Optimal k')
+plt.grid(True)
+plt.show()
+```
+
+### 5. Perform standard k-means clustering in the feature space Z to obtain k initial centroids
+
+```{python}
+n_clusters_according_wss = 2
+n_clusters = n_clusters_according_wss
+kmeans = KMeans(n_clusters=n_clusters, n_init=1)
+y_pred = kmeans.fit_predict(latent_space)
+cluster_centers = kmeans.cluster_centers_
+```
+
+# Second step: Optimize the cluster centers {µj} and DNN parameters θ using Stochastic Gradient Descent (SGD) with momentum.
+
+```{python}
+class ClusteringLayer(Layer):
+    """
+    Clustering layer converts input sample (feature) to soft label, i.e. a vector that represents the probability of the
+    sample belonging to each cluster. The probability is calculated with student's t-distribution.
+
+    # Example
+    
+    #    model.add(ClusteringLayer(n_clusters=10))
+    
+    # Arguments
+    #    n_clusters: number of clusters.
+    #    weights: list of Numpy array with shape `(n_clusters, n_features)` witch represents the initial cluster centers.
+        alpha: degrees of freedom parameter in Student's t-distribution. Default to 1.0.
+    # Input shape
+        2D tensor with shape: `(n_samples, n_features)`.
+    # Output shape
+        2D tensor with shape: `(n_samples, n_clusters)`.
+    """
+
+    def __init__(self, n_clusters, weights=None, alpha=1.0, **kwargs):
+        if 'input_shape' not in kwargs and 'input_dim' in kwargs:
+            kwargs['input_shape'] = (kwargs.pop('input_dim'),)
+        super(ClusteringLayer, self).__init__(**kwargs)
+        self.n_clusters = n_clusters
+        self.alpha = alpha
+        self.initial_weights = weights
+        self.input_spec = InputSpec(ndim=2)
+
+    def build(self, input_shape):
+        assert len(input_shape) == 2
+        input_dim = input_shape[1]
+        self.input_spec = InputSpec(dtype=K.floatx(), shape=(None, input_dim))
+       # self.clusters = self.add_weight((self.n_clusters, input_dim), initializer='glorot_uniform', name='clusters')
+        self.clusters = self.add_weight(shape=(self.n_clusters, input_dim), initializer='glorot_uniform', name='clusters')
+        if self.initial_weights is not None:
+            self.set_weights(self.initial_weights)
+            del self.initial_weights
+        self.built = True
+
+    def call(self, inputs, **kwargs):
+        """ student t-distribution, as same as used in t-SNE algorithm.
+         Measure the similarity between embedded point z_i and centroid µ_j.
+                 q_ij = 1/(1+dist(x_i, µ_j)^2), then normalize it.
+                 q_ij can be interpreted as the probability of assigning sample i to cluster j.
+                 (i.e., a soft assignment)
+        Arguments:
+            inputs: the variable containing data, shape=(n_samples, n_features)
+        Return:
+            q: student's t-distribution, or soft labels for each sample. shape=(n_samples, n_clusters)
+        """
+        q = 1.0 / (1.0 + (K.sum(K.square(K.expand_dims(inputs, axis=1) - self.clusters), axis=2) / self.alpha))
+        q **= (self.alpha + 1.0) / 2.0
+        q = K.transpose(K.transpose(q) / K.sum(q, axis=1)) # Make sure each sample's 10 values add up to 1.
+        return q
+
+    def compute_output_shape(self, input_shape):
+        assert input_shape and len(input_shape) == 2
+        return input_shape[0], self.n_clusters
+
+    def get_config(self):
+        config = {'n_clusters': self.n_clusters}
+        base_config = super(ClusteringLayer, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+```
+
+```{python}
+clustering_layer = ClusteringLayer(n_clusters, weights = [cluster_centers],name='clustering')(encoder.output)
+model = Model(inputs=encoder.input, outputs=clustering_layer)
+```
+
+```{python}
+from keras.utils import plot_model
+plot_model(model, to_file='model.png', show_shapes=True)
+from IPython.display import Image
+Image(filename='model.png')
+```
+
+```{python}
+model.compile(optimizer=SGD(0.01, 0.9), loss='kld')
+```
+
+```{python}
+y_pred_last = np.copy(y_pred)
+```
+
+I already initialize the weights when creating the layer, so I comment the next block of code
+
+```{python}
+# 
+# model.get_layer(name='clustering').set_weights([kmeans.cluster_centers_])
+```
+
+```{python}
+kmeans.cluster_centers_
+```
+
+```{python}
+def target_distribution(q):
+    weight = q ** 2 / q.sum(0)
+    return (weight.T / weight.sum(1)).T
+```
+
+```{python}
+x = np.concatenate([batch.numpy() for batch in train_inputs], axis=0)
+```
+
+```{python}
+loss = 0
+index = 0
+maxiter = 3000
+update_interval = 140
+index_array = np.arange(x.shape[0])
+y = None
+```
+
+```{python}
+tol = 0.001 # tolerance threshold to stop training
+```
+
+```{python}
+import tensorflow as tf
+for ite in range(int(maxiter)):
+    if ite % update_interval == 0:
+        q = model.predict(x, verbose=0)
+        p = target_distribution(q)  # update the auxiliary target distribution p
+
+        # evaluate the clustering performance
+        y_pred = q.argmax(1)
+        if y is not None:
+            acc = np.round(metrics.accuracy_score(y, y_pred), 5)
+            nmi = np.round(metrics.normalized_mutual_info_score(y, y_pred), 5)
+            ari = np.round(metrics.adjusted_rand_score(y, y_pred), 5)
+            loss = np.round(loss, 5)
+            print('Iter %d: acc = %.5f, nmi = %.5f, ari = %.5f' % (ite, acc, nmi, ari), ' ; loss=', loss)
+
+        # check stop criterion - model convergence
+        delta_label = np.sum(y_pred != y_pred_last).astype(np.float32) / y_pred.shape[0]
+        y_pred_last = np.copy(y_pred)
+        if ite > 0 and delta_label < tol:
+            print('delta_label ', delta_label, '< tol ', tol)
+            print('Reached tolerance threshold. Stopping training.')
+            break
+    idx = index_array[index * batch_size: min((index+1) * batch_size, x.shape[0])]
+    loss = model.train_on_batch(x=x[idx], y=p[idx])
+    index = index + 1 if (index + 1) * batch_size <= x.shape[0] else 0
+```
+
+```{python}
+# model.trainable_weights
+```
+
+```{python}
+# Eval.
+q = model.predict(x, verbose=0)
+p = target_distribution(q)  # update the auxiliary target distribution p
+
+# evaluate the clustering performance
+y_pred = q.argmax(1)
+if y is not None:
+    acc = np.round(metrics.accuracy_score(y, y_pred), 5)
+    nmi = np.round(metrics.normalized_mutual_info_score(y, y_pred), 5)
+    ari = np.round(metrics.adjusted_rand_score(y, y_pred), 5)
+    loss = np.round(loss, 5)
+    print('Acc = %.5f, nmi = %.5f, ari = %.5f' % (acc, nmi, ari), ' ; loss=', loss)
+```
+
+-   We don't have true labels of y, so the confusion matrix should be computed
+
+```{python}
+#import seaborn as sns
+#import sklearn.metrics
+#import matplotlib.pyplot as plt
+#sns.set(font_scale=1)
+#confusion_matrix = sklearn.metrics.confusion_matrix(y, y_pred)
+
+#plt.figure(figsize=(10, 8))
+#sns.heatmap(confusion_matrix, annot=True, fmt="d", annot_kws={"size": 10});
+#plt.title("Confusion matrix", fontsize=20)
+#plt.ylabel('True label', fontsize=10)
+#plt.xlabel('Clustering label', fontsize=10)
+#plt.show()
+```
